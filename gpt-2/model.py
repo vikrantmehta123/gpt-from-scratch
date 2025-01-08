@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import tiktoken
+
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
 
 @dataclass
 class GPTConfig:
@@ -108,3 +113,44 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
 
         return logits
+
+num_return_sequences = 5 # number of sequences to generate.
+max_length = 30 # The size of the generated text
+
+# Instantiate the model
+model = GPT(GPTConfig())
+model.eval()
+model.to(device) # This is not going to work on laptop
+
+# Convert the prompt into tokens using the tokenizer used for GPT-2
+enc = tiktoken.get_encoding('gpt-2')
+tokens = enc.encode("Hello, I'm a language model, ")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = torch.unsqueeze(0).repeat(num_return_sequences, 1) # We want to generate five sequences. So we repeat same prompt, five times
+x = tokens.to(device)
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) <= max_length:
+    with torch.no_grad():
+        logits = model(x)
+        logits = logits[:, -1, :]
+
+        probs = F.softmax(logits, dim=-1)
+
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # Use Top K sampling method to select 50 tokens with highest probabilities
+
+        ix = torch.multinomial(topk_probs, 1) # Sample one token from the top 50 tokens for each batch-> (B, 1)
+
+        # From the topk token indices, we want to select the only the ones that we sampled for each batch. And we want to collect them in one tensor
+        xcol = torch.gather(topk_indices, -1, ix)
+
+        # Append the new tokens to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# Decode and print
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist() # Get the tokens for the ith sequence
+    decoded = enc.decode(tokens)
+    print("> ", decoded)
