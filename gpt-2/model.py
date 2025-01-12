@@ -221,10 +221,10 @@ class DataLoaderLite:
 # endregion
 
 # region Learning Rate Scheduler, Optimizer
-max_steps = 15 # maximum optimization "steps"
+max_steps = 10 # maximum optimization "steps"
 max_lr = 6e-4
 min_lr = max_lr * 0.1 # Min LR is 10% of max lr
-warmup_steps = 5
+warmup_steps = 2
 
 def get_lr(it):
     if it < warmup_steps:
@@ -306,54 +306,56 @@ for step in range(max_steps):
     if master_process:
         print(f"Step {step:4d} | Loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec} | lr: {lr:4e}")
 
+if master_process:
+    # optionally write model checkpoints
+    checkpoint_path = os.path.join('.', f"model_{step:05d}.pth")
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        'config': raw_model.config,
+        'step': step, 
+        'optimizer_state_dict': optimizer.state_dict()
+    }
+    # you might also want to add optimizer.state_dict() and
+    # rng seeds etc., if you wanted to more exactly resume training
+    torch.save(checkpoint, checkpoint_path)
+
+# generate from the model (except step 0, which is noise)
+enc = tiktoken.get_encoding('gpt2')
+model.eval()
+num_return_sequences = 4
+max_length = 32
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+xgen = tokens.to(device)
+sample_rng = torch.Generator(device=device)
+sample_rng.manual_seed(42 + ddp_rank)
+while xgen.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(xgen) # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # append to the sequence
+        xgen = torch.cat((xgen, xcol), dim=1)
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = xgen[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(f"rank {ddp_rank} sample {i}: {decoded}")
 
 if ddp:
     destroy_process_group()
-
-model.to('cpu')
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-}, '/kaggle/working/')
-
-# endregion
-
-# region Sampling Text
-
-model.eval()
-num_return_sequences = 5 # number of sequences to generate.
-max_length = 30 # The size of the generated text
-# Convert the prompt into tokens using the tokenizer used for GPT-2
-enc = tiktoken.get_encoding('gpt-2')
-tokens = enc.encode("Hello, I'm a language model, ")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = torch.unsqueeze(0).repeat(num_return_sequences, 1) # We want to generate five sequences. So we repeat same prompt, five times
-x = tokens.to(device)
-
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-
-while x.size(1) <= max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-
-        probs = F.softmax(logits, dim=-1)
-
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # Use Top K sampling method to select 50 tokens with highest probabilities
-
-        ix = torch.multinomial(topk_probs, 1) # Sample one token from the top 50 tokens for each batch-> (B, 1)
-
-        # From the topk token indices, we want to select the only the ones that we sampled for each batch. And we want to collect them in one tensor
-        xcol = torch.gather(topk_indices, -1, ix)
-
-        # Append the new tokens to the sequence
-        x = torch.cat((x, xcol), dim=1)
-
-# Decode and print
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist() # Get the tokens for the ith sequence
-    decoded = enc.decode(tokens)
-    print("> ", decoded)
 
 # endregion
