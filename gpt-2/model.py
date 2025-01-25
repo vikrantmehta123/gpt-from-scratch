@@ -137,7 +137,7 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
         # Initialize the weights as per GPT-2 configs
-        self.apply(self._init_weights())
+        self.apply(self._init_weights)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -235,6 +235,12 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B*T+1]
@@ -272,7 +278,7 @@ def get_lr(it):
 
 # Instantiate the model
 total_batch_size = 524288 # 2^19 tokens in one batch
-B = 8
+B = 4
 T = 1024
 
 grad_accum_steps = (total_batch_size) // (B * T * ddp_world_size) # Since there are multiple GPUs, each will have B * T micro batch running
@@ -332,7 +338,7 @@ for step in range(max_steps):
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint_path = os.path.join(log_dir, f"model.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
@@ -384,7 +390,7 @@ for step in range(max_steps):
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    accumulated_loss = 0.0
+    loss_accum = 0.0
     
     # Accumulate gradients for some time before you update
     for micro_step in range(grad_accum_steps):
@@ -398,13 +404,12 @@ for step in range(max_steps):
             logits, loss = model(x, y) 
 
         loss = loss / grad_accum_steps
-        accumulated_loss += loss.detach() # To keep track of how much loss we accumulated over micro batches for printing
+        loss_accum += loss.detach() # To keep track of how much loss we accumulated over micro batches for printing
         
         # Synchronize only when the total batch is processed
         loss.backward() # accumulate gradients
-
     if ddp:
-        dist.all_reduce(accumulated_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
 
@@ -426,7 +431,7 @@ for step in range(max_steps):
     if master_process:
         print(f"Step {step:4d} | Loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec} | lr: {lr:4e}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {accumulated_loss.item():.6f}\n")
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
